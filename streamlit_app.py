@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import shap
+import matplotlib.pyplot as plt
 
 from sklearn.base import BaseEstimator, TransformerMixin, ClassifierMixin
 
@@ -231,6 +233,117 @@ with st.form("prediction_form"):
     submitted = st.form_submit_button("Predict Satisfaction", use_container_width=True)
 
 
+
+
+# ============================================================
+# SHAP explanation helpers
+# ============================================================
+
+def get_final_estimator(pipeline):
+    """Return the final classifier from a sklearn Pipeline."""
+    if hasattr(pipeline, "named_steps") and "clf" in pipeline.named_steps:
+        clf = pipeline.named_steps["clf"]
+        return getattr(clf, "model_", clf)
+    return pipeline
+
+
+def get_transformed_feature_names(pipeline, X_transformed):
+    """
+    Try to recover feature names after preprocessing/selection.
+    If PCA exists, SHAP is explained over principal components.
+    """
+    n_features = X_transformed.shape[1]
+
+    if not hasattr(pipeline, "named_steps"):
+        return [f"feature_{i}" for i in range(n_features)]
+
+    steps = pipeline.named_steps
+
+    # If PCA exists before classifier, transformed features are components.
+    if "pca" in steps:
+        return [f"PC_{i + 1}" for i in range(n_features)]
+
+    try:
+        if "preprocessor" in steps:
+            names = steps["preprocessor"].get_feature_names_out()
+            names = np.array(names, dtype=object)
+
+            if "selector" in steps:
+                mask = steps["selector"].get_support()
+                names = names[mask]
+
+            if len(names) == n_features:
+                return [str(name) for name in names]
+    except Exception:
+        pass
+
+    return [f"feature_{i}" for i in range(n_features)]
+
+
+def explain_xgboost_prediction(pipeline, input_df):
+    """
+    Compute SHAP values for one prediction using the fitted XGBoost model
+    inside the saved sklearn pipeline.
+    """
+    if not hasattr(pipeline, "named_steps"):
+        raise ValueError("SHAP explanation requires a sklearn Pipeline.")
+
+    # Transform raw app input using all pipeline steps except the classifier.
+    X_transformed = pipeline[:-1].transform(input_df)
+
+    if hasattr(X_transformed, "toarray"):
+        X_transformed = X_transformed.toarray()
+
+    X_transformed = np.asarray(X_transformed)
+
+    feature_names = get_transformed_feature_names(pipeline, X_transformed)
+
+    final_model = get_final_estimator(pipeline)
+
+    explainer = shap.TreeExplainer(final_model)
+    shap_values = explainer.shap_values(X_transformed)
+
+    # SHAP may return either:
+    # - list[class_0_values, class_1_values]
+    # - ndarray with shape (n_samples, n_features)
+    # - ndarray with shape (n_samples, n_features, n_classes)
+    if isinstance(shap_values, list):
+        values = shap_values[1][0]
+    else:
+        shap_values = np.asarray(shap_values)
+        if shap_values.ndim == 3:
+            values = shap_values[0, :, 1]
+        elif shap_values.ndim == 2:
+            values = shap_values[0]
+        else:
+            values = shap_values.reshape(-1)
+
+    explanation_df = pd.DataFrame({
+        "feature": feature_names,
+        "shap_value": values,
+        "absolute_impact": np.abs(values)
+    }).sort_values("absolute_impact", ascending=False)
+
+    return explanation_df
+
+
+def plot_shap_bar(explanation_df, top_n=12):
+    """
+    Simple matplotlib SHAP bar chart.
+    Positive SHAP values push prediction toward satisfaction;
+    negative values push prediction toward neutral/dissatisfied.
+    """
+    top = explanation_df.head(top_n).iloc[::-1]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.barh(top["feature"], top["shap_value"])
+    ax.axvline(0, linewidth=1)
+    ax.set_xlabel("SHAP value")
+    ax.set_title("Top SHAP Drivers for This Prediction")
+    fig.tight_layout()
+    return fig
+
+
 # ============================================================
 # Prediction
 # ============================================================
@@ -312,6 +425,41 @@ if submitted:
 
     with st.expander("See input data used for prediction"):
         st.dataframe(input_data, use_container_width=True)
+
+
+    st.subheader("🔍 SHAP Explanation")
+
+    if model_name == "XGBoost":
+        try:
+            explanation_df = explain_xgboost_prediction(model, input_data)
+
+            st.caption(
+                "Positive SHAP values push the prediction toward **Satisfied**. "
+                "Negative SHAP values push it toward **Neutral / Dissatisfied**."
+            )
+
+            top_explanation = explanation_df.head(12).copy()
+            top_explanation["shap_value"] = top_explanation["shap_value"].round(4)
+            top_explanation["absolute_impact"] = top_explanation["absolute_impact"].round(4)
+
+            st.dataframe(
+                top_explanation,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            fig = plot_shap_bar(explanation_df, top_n=12)
+            st.pyplot(fig)
+
+        except Exception as e:
+            st.error("SHAP explanation could not be generated for this prediction.")
+            st.exception(e)
+    else:
+        st.info(
+            "SHAP explanation is currently enabled for the XGBoost model only. "
+            "KNN explanations require slower model-agnostic SHAP, which is not ideal for a live Streamlit app."
+        )
+
 
 
 # ============================================================
